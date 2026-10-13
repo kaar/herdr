@@ -233,3 +233,149 @@ async fn public_pane_move_without_effective_focus_preserves_client_views() {
         shutdown_test_runtimes(&mut server);
     }
 }
+
+#[tokio::test]
+async fn public_pane_move_to_new_tab_resizes_moved_terminal_immediately() {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("move-geometry");
+    let left_pane = workspace.tabs[0].root_pane;
+    let moved_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+    let reference_tab = workspace.test_add_tab(Some("reference"));
+    let reference_pane = workspace.tabs[reference_tab].root_pane;
+    workspace.switch_tab(0);
+    for pane_id in [left_pane, moved_pane, reference_pane] {
+        workspace.insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+        );
+    }
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.ensure_test_terminals();
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+    let moved_id = server.app.public_pane_id(0, moved_pane).unwrap();
+
+    let (control, _render) = connect_test_shell(&mut server, 9, 100, 30);
+    let _ = client_shell_snapshot(&control);
+    let runtime_size = |server: &HeadlessServer, pane_id| {
+        server.app.state.workspaces[0].test_runtimes[&pane_id].current_size()
+    };
+    let split_size = runtime_size(&server, moved_pane);
+    let full_tab_size = runtime_size(&server, reference_pane);
+    assert_ne!(
+        split_size, full_tab_size,
+        "a split pane must start narrower than a single-pane tab"
+    );
+
+    let moved = public_move(
+        &mut server,
+        PaneMoveParams {
+            pane_id: moved_id,
+            destination: PaneMoveDestination::NewTab {
+                workspace_id: None,
+                label: None,
+            },
+            focus: true,
+        },
+    )
+    .unwrap();
+    assert!(moved.changed);
+    assert_eq!(server.shell_tab_id_for_client(9), Some(moved.pane.tab_id));
+
+    // No client input or render happens here: the move itself must apply the
+    // new tab geometry so full-screen apps receive the resize right away.
+    assert_eq!(
+        runtime_size(&server, moved_pane),
+        full_tab_size,
+        "moved terminal must be resized to its new tab without waiting for input"
+    );
+    assert_eq!(
+        runtime_size(&server, left_pane),
+        full_tab_size,
+        "the remaining source pane must fill its tab too"
+    );
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
+async fn interactive_client_pane_move_to_new_tab_resizes_moved_terminal_immediately() {
+    let mut server = test_headless_server();
+    let mut workspace = crate::workspace::Workspace::test_new("interactive-move-geometry");
+    let left_pane = workspace.tabs[0].root_pane;
+    let moved_pane = workspace.test_split(ratatui::layout::Direction::Horizontal);
+    let reference_tab = workspace.test_add_tab(Some("reference"));
+    let reference_pane = workspace.tabs[reference_tab].root_pane;
+    workspace.switch_tab(0);
+    for pane_id in [left_pane, moved_pane, reference_pane] {
+        workspace.insert_test_runtime(
+            pane_id,
+            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b""),
+        );
+    }
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.ensure_test_terminals();
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+    let moved_id = server.app.public_pane_id(0, moved_pane).unwrap();
+
+    let (control, _render) = connect_test_shell(&mut server, 9, 100, 30);
+    let _ = client_shell_snapshot(&control);
+    let runtime_size = |server: &HeadlessServer, pane_id| {
+        server.app.state.workspaces[0].test_runtimes[&pane_id].current_size()
+    };
+    let split_size = runtime_size(&server, moved_pane);
+    let full_tab_size = runtime_size(&server, reference_pane);
+    assert_ne!(
+        split_size, full_tab_size,
+        "a split pane must start narrower than a single-pane tab"
+    );
+
+    let (respond_to, response_rx) = std::sync::mpsc::channel();
+    server.handle_client_shell_api_request(
+        9,
+        crate::api::ApiRequestMessage {
+            request: crate::api::schema::Request {
+                id: "interactive-move-pane".into(),
+                method: crate::api::schema::Method::PaneMove(PaneMoveParams {
+                    pane_id: moved_id,
+                    destination: PaneMoveDestination::NewTab {
+                        workspace_id: None,
+                        label: None,
+                    },
+                    focus: true,
+                }),
+            },
+            respond_to,
+            response_write_complete: None,
+        },
+    );
+    let response = response_rx.recv().expect("pane move response");
+    let SuccessResponse {
+        result: ResponseResult::PaneMove { move_result },
+        ..
+    } = serde_json::from_str::<SuccessResponse>(&response).expect("pane move success")
+    else {
+        panic!("expected pane move response, got {response}");
+    };
+    assert!(move_result.changed);
+    assert_eq!(
+        server.shell_tab_id_for_client(9),
+        Some(move_result.pane.tab_id)
+    );
+
+    // The interactive client that issued the move owns the new tab geometry, so
+    // the moved PTY must be resized without waiting for later input or render.
+    assert_eq!(
+        runtime_size(&server, moved_pane),
+        full_tab_size,
+        "moved terminal must be resized to its new tab without waiting for input"
+    );
+    assert_eq!(
+        runtime_size(&server, left_pane),
+        full_tab_size,
+        "the remaining source pane must fill its tab too"
+    );
+    shutdown_test_runtimes(&mut server);
+}
