@@ -161,6 +161,19 @@ impl HeadlessServer {
     }
 
     pub(super) fn focus_all_shell_clients_on_default_target(&mut self) {
+        let focus_before = self.shell_focus_targets();
+        let focused_tabs_before = self.focused_shell_tabs();
+        self.focus_all_shell_clients_on_default_target_from_snapshot(
+            focus_before,
+            &focused_tabs_before,
+        );
+    }
+
+    fn focus_all_shell_clients_on_default_target_from_snapshot(
+        &mut self,
+        focus_before: Vec<(u64, Option<ShellFocusTarget>)>,
+        focused_tabs_before: &HashSet<String>,
+    ) {
         let Some(target) = self.default_shell_target() else {
             return;
         };
@@ -168,8 +181,6 @@ impl HeadlessServer {
         let Some(tab_id) = self.tab_id_for_target(target) else {
             return;
         };
-        let focus_before = self.shell_focus_targets();
-        let focused_tabs_before = self.focused_shell_tabs();
         for client in self
             .clients
             .values_mut()
@@ -180,7 +191,7 @@ impl HeadlessServer {
             }
         }
         let (lost, gained) =
-            self.shell_location_focus_transitions(focus_before, &focused_tabs_before);
+            self.shell_location_focus_transitions(focus_before, focused_tabs_before);
         self.app.accept_current_focus_with_api_events();
         self.send_shell_focus_transitions(&lost, &gained);
     }
@@ -864,6 +875,10 @@ impl HeadlessServer {
             (original, proxy_rx)
         });
         let reconcile = Self::shell_locations_may_need_reconcile(&msg.request.method);
+        // tab.layout.focused() is shared mutable state, not a historical pane value.
+        // Capture client focus before dispatch changes that selection.
+        let pane_focus_before = matches!(&msg.request.method, api::schema::Method::PaneFocus(_))
+            .then(|| (self.shell_focus_targets(), self.focused_shell_tabs()));
         let changed = self.handle_api_request_with_shutdown_check_inner(msg, false, false);
         let proxied_result = forward_proxied_api_response(response_proxy);
         let proxied_request_succeeded = proxied_result.is_some();
@@ -893,7 +908,14 @@ impl HeadlessServer {
             || (create_focus_requested && target_changed)
             || pane_move_focus_succeeded;
         if public_focus_succeeded {
-            self.focus_all_shell_clients_on_default_target();
+            if let Some((focus_before, focused_tabs_before)) = pane_focus_before {
+                self.focus_all_shell_clients_on_default_target_from_snapshot(
+                    focus_before,
+                    &focused_tabs_before,
+                );
+            } else {
+                self.focus_all_shell_clients_on_default_target();
+            }
         }
         if reconcile
             || target_changed
