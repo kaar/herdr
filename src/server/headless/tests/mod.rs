@@ -2239,6 +2239,131 @@ async fn client_local_navigation_emits_pane_focused_only_when_that_client_moves(
 }
 
 #[tokio::test]
+async fn public_pane_focus_same_tab_emits_terminal_reports() {
+    use api::schema::{EventData, Method, PaneTarget, ResponseResult, SuccessResponse};
+
+    let event_hub = api::EventHub::default();
+    let mut server = test_headless_server_with_event_hub(event_hub.clone());
+    let mut workspace = crate::workspace::Workspace::test_new("public-pane-focus");
+    let first_pane = workspace.tabs[0].root_pane;
+    let second_pane = workspace.test_split(ratatui::layout::Direction::Vertical);
+    let (first_runtime, mut first_input) =
+        crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+            80,
+            24,
+            0,
+            b"\x1b[?1004h",
+            4,
+        );
+    let (second_runtime, mut second_input) =
+        crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+            80,
+            24,
+            0,
+            b"\x1b[?1004h",
+            4,
+        );
+    workspace.insert_test_runtime(first_pane, first_runtime);
+    workspace.insert_test_runtime(second_pane, second_runtime);
+    workspace.tabs[0].layout.focus_pane(first_pane);
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.ensure_test_terminals();
+    server.app.state.active = Some(0);
+    server.app.state.selected = 0;
+    server.app.state.mode = crate::app::Mode::Terminal;
+    let second_pane_id = server.app.public_pane_id(0, second_pane).unwrap();
+    let workspace_id = server.app.public_workspace_id(0);
+
+    let (_control, _render) = connect_matching_test_shell(&mut server, 63);
+    server.clients.get_mut(&63).unwrap().outer_terminal_focus = Some(true);
+    server.app.accept_current_focus_without_events();
+    while first_input.try_recv().is_ok() {}
+    while second_input.try_recv().is_ok() {}
+    let sequence = event_hub.current_sequence();
+
+    for repeated in [false, true] {
+        let request_sequence = event_hub.current_sequence();
+        let (respond_to, response_rx) = std::sync::mpsc::channel();
+        server.handle_api_request_with_shutdown_check(api::ApiRequestMessage {
+            request: api::schema::Request {
+                id: "focus-second-pane".into(),
+                method: Method::PaneFocus(PaneTarget {
+                    pane_id: second_pane_id.clone(),
+                }),
+            },
+            respond_to,
+            response_write_complete: None,
+        });
+        let response = response_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("pane focus response");
+        let response: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let ResponseResult::PaneInfo { pane } = response.result else {
+            panic!("expected pane info");
+        };
+        assert_eq!(pane.pane_id, second_pane_id);
+        assert!(pane.focused);
+        assert_eq!(
+            server.app.state.workspaces[0].tabs[0].layout.focused(),
+            second_pane
+        );
+
+        if !repeated {
+            assert_eq!(
+                first_input.try_recv().expect("previous pane focus lost"),
+                Bytes::from_static(b"\x1b[O")
+            );
+            assert_eq!(
+                second_input
+                    .try_recv()
+                    .expect("destination pane focus gained"),
+                Bytes::from_static(b"\x1b[I")
+            );
+        }
+        assert!(first_input.try_recv().is_err(), "extra lost report");
+        assert!(second_input.try_recv().is_err(), "extra gained report");
+        let focused = event_hub
+            .events_after(sequence)
+            .into_iter()
+            .filter_map(|(_, event)| match event.data {
+                EventData::PaneFocused {
+                    pane_id,
+                    workspace_id,
+                } => Some((pane_id, workspace_id)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            focused,
+            vec![(second_pane_id.clone(), workspace_id.clone())]
+        );
+
+        let sequence_after = event_hub.current_sequence();
+        server.app.sync_focus_events();
+        assert!(
+            first_input.try_recv().is_err(),
+            "normal loop duplicated lost report"
+        );
+        assert!(
+            second_input.try_recv().is_err(),
+            "normal loop duplicated gained report"
+        );
+        assert_eq!(
+            event_hub.current_sequence(),
+            sequence_after,
+            "normal loop emitted API events"
+        );
+        if repeated {
+            assert_eq!(
+                sequence_after, request_sequence,
+                "repeat emitted API events"
+            );
+        }
+    }
+    shutdown_test_runtimes(&mut server);
+}
+
+#[tokio::test]
 async fn public_focus_moves_shell_focus_between_tabs() {
     let mut server = test_headless_server();
     let mut workspace = crate::workspace::Workspace::test_new("public-focus-events");
